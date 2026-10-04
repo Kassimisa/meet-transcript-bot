@@ -1,0 +1,13 @@
+{
+  "meeting_id": "test-avec-document",
+  "participants": ["Sara Kassimi", "Karim"],
+  "raw_transcript_text": "Sara Kassimi: On commence par le budget du quatrième trimestre.\nKarim: D'accord, on garde l'enveloppe prévue pour la campagne.\nSara Kassimi: Parfait. Karim, tu envoies le plan final à ACME avant vendredi.",
+  "started_at": "2026-09-19T10:00:00.000Z",
+  "ended_at": "2026-09-19T10:20:00.000Z",
+  "documents": [
+    {
+      "name": "budget.xlsx",
+      "text": "Poste\tMontant\nCampagne ACME\t12000 EUR\nEvenement\t3000 EUR\nTotal T4\t15000 EUR"
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+# Google Chrome profile used by the bot — contains real session cookies.
+# NEVER commit this: anyone with it could act as your Google account.
+google-session/
+
+# npm dependencies — reinstalled with `npm install`.
+node_modules/
+
+# Generated at runtime, contains real meeting content.
+transcript*.json
+report.md
+documents/
+
+# Debug artifacts, only created when something goes wrong.
+debug-*.png
+debug-captions-dom.html

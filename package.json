@@ -1,0 +1,15 @@
+{
+  "name": "meet-transcript-bot",
+  "version": "1.0.0",
+  "description": "Joins a Google Meet as yourself, turns on live captions, and saves the transcript — no paid API, no self-hosted Docker stack.",
+  "main": "bot.js",
+  "type": "commonjs",
+  "scripts": {
+    "login": "node login.js",
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "officeparser": "^5.2.2",
+    "playwright": "^1.48.0"
+  }
+}
