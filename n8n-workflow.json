@@ -1,0 +1,318 @@
+{
+  "name": "Meet Transcript Bot — AI Meeting Assistant",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "meet-transcript",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "name": "Webhook"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'received', upload_url: $execution.resumeFormUrl } }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        240,
+        0
+      ],
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {
+        "resume": "form",
+        "formTitle": "Documents de la réunion",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "file",
+              "fieldType": "file"
+            }
+          ]
+        },
+        "limitWaitTime": true,
+        "resumeUnit": "minutes",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        448,
+        0
+      ],
+      "name": "Wait"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.compression",
+      "typeVersion": 1.1,
+      "position": [
+        896,
+        0
+      ],
+      "name": "Compression",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const MAX_CHARS = 30000;\n\nconst decode = (s) =>\n  s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '\"').replace(/&apos;/g, \"'\").replace(/&amp;/g, '&');\nconst texts = (xml, tag) =>\n  [...xml.matchAll(new RegExp(`<${tag}(?: [^>]*)?>([\\\\s\\\\S]*?)</${tag}>`, 'g'))].map((m) => m[1]).join('');\nconst paragraphs = (xml, tag) => xml.match(new RegExp(`<${tag}[ >][\\\\s\\\\S]*?</${tag}>`, 'g')) || [];\nconst num = (p) => Number(p.match(/(\\d+)\\.xml$/)[1]);\n\nconst names = $('Split Files').all().map((i) => i.json.originalName);\nconst documents = [];\nconst items = $input.all();\n\nfor (let i = 0; i < items.length; i++) {\n  const item = items[i];\n  if ($('Split Files').all()[i]?.json.noFile) continue;\n  const name = names[i] || `file ${i + 1}`;\n\n  const parts = {};\n  for (const [key, meta] of Object.entries(item.binary || {})) {\n    let full = meta.fileName || '';\n    if (meta.directory && !full.includes('/')) full = `${meta.directory}/${full}`;\n    parts[full.replace(/\\\\/g, '/').replace(/^\\/+/, '')] = key;\n  }\n  const read = async (full) => (await this.helpers.getBinaryDataBuffer(i, parts[full])).toString('utf8');\n  const paths = Object.keys(parts);\n  let text = '';\n\n  if (parts['word/document.xml']) {\n    const xml = await read('word/document.xml');\n    text = paragraphs(xml, 'w:p').map((p) => decode(texts(p, 'w:t'))).filter(Boolean).join('\\n');\n  } else if (paths.some((p) => /^ppt\\/slides\\/slide\\d+\\.xml$/.test(p))) {\n    const slides = paths.filter((p) => /^ppt\\/slides\\/slide\\d+\\.xml$/.test(p)).sort((a, b) => num(a) - num(b));\n    const out = [];\n    for (const p of slides) {\n      const xml = await read(p);\n      const body = paragraphs(xml, 'a:p').map((x) => decode(texts(x, 'a:t'))).filter(Boolean).join('\\n');\n      if (body) out.push(`Slide ${num(p)}:\\n${body}`);\n    }\n    text = out.join('\\n\\n');\n  } else if (parts['xl/workbook.xml']) {\n    const shared = [];\n    if (parts['xl/sharedStrings.xml']) {\n      const xml = await read('xl/sharedStrings.xml');\n      for (const si of xml.match(/<si\\b(?:[^>]*\\/>|[^>]*>[\\s\\S]*?<\\/si>)/g) || []) shared.push(decode(texts(si, 't')));\n    }\n    const wb = await read('xl/workbook.xml');\n    const sheetNames = [...wb.matchAll(/<sheet\\b[^>]*\\bname=\"([^\"]*)\"/g)].map((m) => decode(m[1]));\n    const sheets = paths.filter((p) => /^xl\\/worksheets\\/sheet\\d+\\.xml$/.test(p)).sort((a, b) => num(a) - num(b));\n    const out = [];\n    for (let s = 0; s < sheets.length; s++) {\n      const xml = await read(sheets[s]);\n      const rows = [];\n      for (const row of xml.match(/<row\\b[^>]*>[\\s\\S]*?<\\/row>/g) || []) {\n        const cells = [];\n        for (const c of row.matchAll(/<c\\b([^>]*?)(?:\\/>|>([\\s\\S]*?)<\\/c>)/g)) {\n          const type = (c[1].match(/\\bt=\"([^\"]*)\"/) || [])[1];\n          const inner = c[2] || '';\n          let v = (inner.match(/<v>([\\s\\S]*?)<\\/v>/) || [])[1];\n          if (type === 's') v = shared[Number(v)];\n          else if (type === 'inlineStr') v = decode(texts(inner, 't'));\n          else if (v !== undefined) v = decode(v);\n          if (v !== undefined && v !== '') cells.push(v);\n        }\n        if (cells.length) rows.push(cells.join('\\t'));\n      }\n      if (rows.length) out.push(`Sheet \"${sheetNames.length === sheets.length ? sheetNames[s] : s + 1}\":\\n${rows.join('\\n')}`);\n    }\n    text = out.join('\\n\\n');\n  }\n\n  text = text.trim();\n  if (text.length > MAX_CHARS) text = text.slice(0, MAX_CHARS);\n  documents.push({\n    name,\n    text: text || '(no readable text found - only .docx, .pptx and .xlsx files are supported)',\n  });\n}\n\nreturn [{ json: { documents } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        -96
+      ],
+      "name": "Extract Document Text"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:11434/api/chat",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": []
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.requestBody) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1616,
+        208
+      ],
+      "name": "HTTP Request"
+    },
+    {
+      "parameters": {
+        "mode": "markdownToHtml",
+        "markdown": "={{ $json.report }}",
+        "destinationKey": "html",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.markdown",
+      "typeVersion": 1,
+      "position": [
+        2032,
+        224
+      ],
+      "name": "Markdown"
+    },
+    {
+      "parameters": {
+        "fromEmail": "your-sender@example.com",
+        "toEmail": "your-recipient@example.com",
+        "subject": "=Rapport de réunion {{ $json.meeting_id }}",
+        "html": "={{ $json.html }}",
+        "options": {
+          "fileAttachments": "report"
+        }
+      },
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        2464,
+        224
+      ],
+      "name": "Send an Email",
+      "credentials": {
+        "smtp": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL",
+          "name": "REPLACE_WITH_YOUR_CREDENTIAL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first();\nconst out = [];\nfor (const b of Object.values(item.binary || {})) {\n  out.push({\n    json: { originalName: b.fileName || 'file' },\n    binary: {\n      data: { ...b, fileName: `${b.fileName || 'file'}.zip`, fileExtension: 'zip', mimeType: 'application/zip' },\n    },\n  });\n}\nif (out.length === 0) return [{ json: { noFile: true } }];\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        0
+      ],
+      "name": "Split Files"
+    },
+    {
+      "parameters": {
+        "jsCode": "const b = $('Webhook').first().json.body;\n\nlet formDocs = [];\ntry {\n  formDocs = $('Extract Document Text').first().json.documents || [];\n} catch (e) {\n  /* no upload */\n}\nconst docs = [...(b.documents || []), ...formDocs];\nconst docsText = docs.length\n  ? docs.map((d) => `### ${d.name}\\n${d.text}`).join('\\n\\n')\n  : '(no documents were shared in this meeting)';\n\n// Detect the transcript language so the report (and its section titles) match it.\nconst FR_WORDS = new Set('le la les des du et est que pour nous vous je une dans sur avec pas qui au aux en ce cette mais ou par sont ont être avoir plus tout très bien oui non merci bonjour'.split(' '));\nconst EN_WORDS = new Set('the and is are to of that for we you i in with it this not have will be was were they there what which but so if do does did can would should hello thanks yes no'.split(' '));\nconst tokens = (b.raw_transcript_text || '').toLowerCase().split(/[^a-zàâçéèêëîïôùûüÿœ']+/).filter(Boolean);\nconst fr = tokens.filter((t) => FR_WORDS.has(t)).length;\nconst en = tokens.filter((t) => EN_WORDS.has(t)).length;\nconst lang = fr >= 2 && fr > en * 1.2 ? 'fr' : en >= 2 && en > fr * 1.2 ? 'en' : 'other';\n\nconst LANGS = {\n  fr: {\n    name: 'French',\n    titles: ['Résumé', 'Décisions clés', 'Actions à mener', 'Informations issues des documents', 'Questions ouvertes'],\n    none: 'Rien à signaler.',\n  },\n  en: {\n    name: 'English',\n    titles: ['Summary', 'Key Decisions', 'Action Items', 'Information from Documents', 'Open Questions'],\n    none: 'Nothing noted.',\n  },\n  other: {\n    name: 'the same language as the transcript',\n    titles: ['Summary', 'Key Decisions', 'Action Items', 'Information from Documents', 'Open Questions'],\n    none: 'Nothing noted.',\n  },\n}[lang];\n\nconst prompt = `You are an assistant that writes meeting reports. Use BOTH sources below: the meeting transcript (auto-captions, may contain errors) and the documents shared during the meeting (if any). Cross-reference them: use the documents to clarify names, figures and terms mentioned in the discussion.\n\nMeeting ID: ${b.meeting_id}\nParticipants: ${(b.participants || []).join(', ') || 'unknown'}\nStarted: ${b.started_at}\nEnded: ${b.ended_at}\n\n## SOURCE 1 - TRANSCRIPT\n\"\"\"\n${b.raw_transcript_text || ''}\n\"\"\"\n\n## SOURCE 2 - SHARED DOCUMENTS\n${docsText}\n\nWrite the ENTIRE report in ${LANGS.name}. Use Markdown with exactly these section titles, in this order:\n${LANGS.titles.map((t) => `## ${t}`).join('\\n')}\n\nUnder \"${LANGS.titles[2]}\", list each action with its owner and deadline when mentioned.\nIf a section has nothing relevant, write: ${LANGS.none}\nDo not invent anything that is not supported by the sources.`;\n\nreturn [{\n  json: {\n    meeting_id: b.meeting_id,\n    participants: b.participants,\n    started_at: b.started_at,\n    ended_at: b.ended_at,\n    lang,\n    requestBody: {\n      model: 'qwen3.5:9b',\n      stream: false,\n      think: false,\n      messages: [{ role: 'user', content: prompt }],\n    },\n  },\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1392,
+        208
+      ],
+      "name": "Build Ollama Request"
+    },
+    {
+      "parameters": {
+        "jsCode": "const report = $json.message?.content || '(no content returned by Ollama)';\nconst meta = $('Build Ollama Request').first().json;\n\nreturn [{\n  json: {\n    meeting_id: meta.meeting_id,\n    participants: meta.participants,\n    started_at: meta.started_at,\n    ended_at: meta.ended_at,\n    lang: meta.lang,\n    report,\n  },\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1840,
+        208
+      ],
+      "name": "Parse Ollama Response"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Builds a structured A4 PDF from the Markdown report (no external library).\n// Glyph widths of Helvetica / Helvetica-Bold for WinAnsi codes 32..255 (per 1000 units).\nconst W = [[278,278,355,556,556,889,667,191,333,333,389,584,278,333,278,278,556,556,556,556,556,556,556,556,556,556,278,278,584,584,584,556,1015,667,667,722,722,667,611,778,722,278,500,667,556,833,722,778,667,778,722,667,611,722,667,944,667,667,611,278,278,278,469,556,333,556,556,500,556,556,278,556,556,222,222,500,222,833,556,556,556,556,333,500,278,556,500,722,500,500,500,334,260,334,584,0,556,0,222,556,333,1000,556,556,333,1000,667,333,1000,0,611,0,0,222,222,333,333,350,556,1000,333,1000,500,333,944,0,500,500,278,333,556,556,556,556,260,556,333,737,370,556,584,333,737,333,400,584,333,333,333,556,537,278,333,333,365,556,834,834,834,611,667,667,667,667,667,667,1000,722,667,667,667,667,278,278,278,278,722,722,778,778,778,778,778,584,778,722,722,722,722,667,667,611,556,556,556,556,556,556,889,500,556,556,556,556,278,278,278,278,556,556,556,556,556,556,556,584,611,556,556,556,556,500,556,500], [278,333,474,556,556,889,722,238,333,333,389,584,278,333,278,278,556,556,556,556,556,556,556,556,556,556,333,333,584,584,584,611,975,722,722,722,722,667,611,778,722,278,556,722,611,833,722,778,667,778,722,667,611,722,667,944,667,667,611,333,278,333,584,556,333,556,611,556,611,556,333,611,611,278,278,556,278,889,611,611,611,611,389,556,333,611,556,778,556,556,500,389,280,389,584,0,556,0,278,556,500,1000,556,556,333,1000,667,333,1000,0,611,0,0,278,278,500,500,350,556,1000,333,1000,556,333,944,0,500,556,278,333,556,556,556,556,280,556,333,737,370,556,584,333,737,333,400,584,333,333,333,611,556,278,333,333,365,556,834,834,834,611,722,722,722,722,722,722,1000,722,667,667,667,667,278,278,278,278,722,722,778,778,778,778,778,584,778,722,722,722,722,667,667,611,556,556,556,556,556,556,889,556,556,556,556,556,278,278,278,278,611,611,611,611,611,611,611,584,611,611,611,611,611,556,611,556]];\n\nconst j = $input.first().json;\nconst lang = j.lang === 'fr' ? 'fr' : 'en';\nconst T = lang === 'fr'\n  ? { title: 'Compte rendu de réunion', meeting: 'Réunion', participants: 'Participants', started: 'Début', ended: 'Fin', duration: 'Durée', footer: 'Généré automatiquement par votre assistant de réunion', page: 'Page' }\n  : { title: 'Meeting report', meeting: 'Meeting', participants: 'Participants', started: 'Started', ended: 'Ended', duration: 'Duration', footer: 'Automatically generated by your meeting assistant', page: 'Page' };\n\nconst PW = 595.28, PH = 841.89, M = 50, BOTTOM = 58, CW = PW - 2 * M;\nconst ACC = [0.10, 0.27, 0.47], ACC2 = [0.17, 0.55, 0.75], ACC_LIGHT = [0.78, 0.85, 0.92];\nconst BODY = [0.15, 0.15, 0.17], GRAY = [0.45, 0.47, 0.50], BOX = [0.94, 0.96, 0.985], WHITE = [1, 1, 1];\n\n// ---- text encoding (Unicode -> WinAnsi) and measuring ----\nconst CP = { 8364: 128, 8218: 130, 402: 131, 8222: 132, 8230: 133, 8224: 134, 8225: 135, 710: 136, 8240: 137, 352: 138, 8249: 139, 338: 140, 381: 142, 8216: 145, 8217: 146, 8220: 147, 8221: 148, 8226: 149, 8211: 150, 8212: 151, 732: 152, 8482: 153, 353: 154, 8250: 155, 339: 156, 382: 158, 376: 159 };\nconst REPL = { ' ': ' ', ' ': ' ', ' ': ' ', ' ': ' ', ' ': ' ', ' ': ' ', '​': '', '→': '->', '←': '<-', '✓': '+', '✔': '+', '≈': '~', '≤': '<=', '≥': '>=' };\nconst toBytes = (s) => {\n  const out = [];\n  for (const ch of String(s)) {\n    if (REPL[ch] !== undefined) { for (const r of REPL[ch]) out.push(r.charCodeAt(0)); continue; }\n    let c = ch.codePointAt(0);\n    if (c === 9 || c === 10 || c === 13) c = 32;\n    if (c >= 32 && c <= 126) out.push(c);\n    else if (c >= 161 && c <= 255) out.push(c);\n    else if (CP[c]) out.push(CP[c]);\n    else if (c > 0xffff || c < 32) continue;\n    else out.push(63);\n  }\n  return out;\n};\nconst widthOf = (s, bold, size) => toBytes(s).reduce((a, c) => a + W[bold ? 1 : 0][c - 32], 0) * size / 1000;\n\n// ---- page model: drawing operations per page, cursor y measured from the top ----\nconst pages = [[]];\nlet pageIdx = 0;\nlet y = M;\nlet contentTop = M;\nconst cur = () => pages[pageIdx];\nconst py = (yy) => (PH - yy).toFixed(2);\nconst col = (c) => c.map((v) => v.toFixed(3)).join(' ');\nconst text = (x, yTop, s, { bold = false, size = 10.5, color = BODY } = {}) => {\n  if (!s) return;\n  cur().push(`BT /${bold ? 'F2' : 'F1'} ${size} Tf ${col(color)} rg ${x.toFixed(2)} ${py(yTop)} Td <${Buffer.from(toBytes(s)).toString('hex')}> Tj ET`);\n};\nconst rect = (x, yTop, w, h, color) => cur().push(`${col(color)} rg ${x.toFixed(2)} ${(PH - yTop - h).toFixed(2)} ${w.toFixed(2)} ${h.toFixed(2)} re f`);\nconst hline = (x1, x2, yTop, color, wd = 0.6) => cur().push(`${col(color)} RG ${wd} w ${x1.toFixed(2)} ${py(yTop)} m ${x2.toFixed(2)} ${py(yTop)} l S`);\nconst ensure = (h) => {\n  if (y + h > PH - BOTTOM) { pages.push([]); pageIdx = pages.length - 1; y = M; contentTop = M; }\n};\n\n// ---- inline Markdown -> styled words, wrapped to a width ----\nconst cleanMd = (t) => t.replace(/\\[([^\\]]+)\\]\\([^)]*\\)/g, '$1').replace(/`([^`]*)`/g, '$1').replace(/<br\\s*\\/?>/gi, ' ').replace(/^>\\s?/, '');\nconst toRuns = (t) => cleanMd(t).split('**').map((p, i) => ({\n  text: p.replace(/\\*([^*\\n]+)\\*/g, '$1').replace(/(^|\\s)_([^_\\n]+)_(?=\\s|$|[.,;:!?])/g, '$1$2'),\n  bold: i % 2 === 1,\n})).filter((r) => r.text);\n\nconst wrap = (runs, maxW, size, forceBold = false) => {\n  const lines = [];\n  let line = [], x = 0;\n  for (const r of runs) {\n    for (const wd of r.text.split(/\\s+/).filter(Boolean)) {\n      const bold = r.bold || forceBold;\n      const pieces = [];\n      let rest = wd;\n      while (widthOf(rest, bold, size) > maxW && rest.length > 1) {\n        let n = rest.length;\n        while (n > 1 && widthOf(rest.slice(0, n), bold, size) > maxW) n--;\n        pieces.push(rest.slice(0, n));\n        rest = rest.slice(n);\n      }\n      pieces.push(rest);\n      pieces.forEach((piece, pi) => {\n        if (pi > 0 && line.length) { lines.push(line); line = []; x = 0; }\n        const ww = widthOf(piece, bold, size);\n        const gap = line.length ? widthOf(' ', bold, size) : 0;\n        if (line.length && x + gap + ww > maxW) { lines.push(line); line = []; x = 0; }\n        const g = line.length ? widthOf(' ', bold, size) : 0;\n        line.push({ w: piece, bold, x: x + g });\n        x += g + ww;\n      });\n    }\n  }\n  if (line.length) lines.push(line);\n  return lines;\n};\nconst drawLines = (lines, x0, size, lead, color = BODY) => {\n  for (const ln of lines) {\n    ensure(lead);\n    for (const w of ln) text(x0 + w.x, y + size, w.w, { bold: w.bold, size, color });\n    y += lead;\n  }\n};\n\n// ---- cover band + meeting information box ----\nconst fmt = (iso) => {\n  const d = new Date(iso);\n  if (isNaN(d)) return String(iso || '-');\n  return new Intl.DateTimeFormat(lang === 'fr' ? 'fr-FR' : 'en-GB', { dateStyle: 'long', timeStyle: 'short', timeZone: 'UTC' }).format(d) + ' (UTC)';\n};\nconst mins = Math.round((new Date(j.ended_at) - new Date(j.started_at)) / 60000);\nconst durTxt = isNaN(mins) || mins < 0 ? '-' : mins >= 60 ? `${Math.floor(mins / 60)} h ${String(mins % 60).padStart(2, '0')} min` : `${mins} min`;\nconst seen = new Set();\nconst people = (j.participants || []).filter((p) => {\n  const k = String(p).trim().toLowerCase();\n  if (!k || seen.has(k)) return false;\n  seen.add(k);\n  return true;\n});\n\nrect(0, 0, PW, 104, ACC);\nrect(0, 104, PW, 4, ACC2);\ntext(M, 52, T.title, { bold: true, size: 24, color: WHITE });\ntext(M, 78, `${T.meeting} : ${j.meeting_id || '-'}`, { size: 11.5, color: [0.85, 0.91, 0.97] });\n\nconst rows = [\n  [T.participants, people.join(', ') || '-'],\n  [T.started, fmt(j.started_at)],\n  [T.ended, fmt(j.ended_at)],\n  [T.duration, durTxt],\n];\nconst LABEL_W = 88, PAD = 12;\nconst rowLines = rows.map(([, v]) => wrap(toRuns(v), CW - 2 * PAD - LABEL_W, 10.5));\nconst boxH = rowLines.reduce((a, l) => a + l.length * 15 + 5, 0) + 2 * PAD - 5;\nrect(M, 128, CW, boxH, BOX);\nrect(M, 128, 3, boxH, ACC2);\ny = 128 + PAD;\nrows.forEach(([label], i) => {\n  text(M + PAD + 3, y + 10.5, label, { bold: true, size: 10.5, color: ACC });\n  rowLines[i].forEach((ln, k) => ln.forEach((w) => text(M + PAD + 3 + LABEL_W + w.x, y + 10.5 + k * 15, w.w, { bold: w.bold, size: 10.5 })));\n  y += rowLines[i].length * 15 + 5;\n});\ny = 128 + boxH + 22;\ncontentTop = y;\n\n// ---- report body (Markdown) ----\nconst heading = (level, raw) => {\n  const t = cleanMd(raw).replace(/\\*/g, '').replace(/#+\\s*$/, '').trim();\n  if (level <= 2) {\n    ensure(75);\n    if (y > contentTop) y += 12;\n    text(M, y + 14, t, { bold: true, size: 14, color: ACC });\n    y += 20;\n    hline(M, PW - M, y, ACC_LIGHT, 1);\n    y += 10;\n  } else {\n    ensure(50);\n    y += 6;\n    text(M, y + 11.5, t, { bold: true, size: 11.5, color: BODY });\n    y += 19;\n  }\n};\nconst bullet = (spaces, txt, label) => {\n  const level = spaces < 2 ? 0 : Math.min(1 + Math.floor((spaces - 2) / 4), 3);\n  const x = M + 8 + level * 16;\n  const tx = x + (label ? 16 : 11);\n  const lines = wrap(toRuns(txt), PW - M - tx, 10.5);\n  ensure(14.5);\n  text(x, y + 10.5, label || (level === 0 ? '•' : '–'), { size: 10.5, bold: !!label, color: ACC });\n  drawLines(lines, tx, 10.5, 14.5);\n  y += 3;\n};\nconst paragraph = (txt) => {\n  drawLines(wrap(toRuns(txt), CW, 10.5), M, 10.5, 15);\n  y += 5;\n};\n\nfor (const raw of String(j.report || '').replace(/\\r/g, '').split('\\n')) {\n  const line = raw.replace(/\\s+$/, '');\n  if (!line.trim()) continue;\n  let m;\n  if ((m = line.match(/^\\s{0,3}(#{1,6})\\s+(.*)$/))) heading(m[1].length, m[2]);\n  else if (/^\\s*([-*_])(?:\\s*\\1){2,}\\s*$/.test(line)) { ensure(14); y += 5; hline(M, PW - M, y, ACC_LIGHT); y += 9; }\n  else if ((m = line.match(/^(\\s*)[-*•+]\\s+(.*)$/))) bullet(m[1].length, m[2]);\n  else if ((m = line.match(/^(\\s*)(\\d+)[.)]\\s+(.*)$/))) bullet(m[1].length, m[3], `${m[2]}.`);\n  else if (line.trim().startsWith('|')) {\n    if (/^[\\s|:\\-]+$/.test(line)) continue;\n    paragraph(line.split('|').map((c) => c.trim()).filter(Boolean).join('  |  '));\n  } else paragraph(line.trim());\n}\n\n// ---- footer on every page ----\nconst n = pages.length;\nfor (let i = 0; i < n; i++) {\n  pageIdx = i;\n  hline(M, PW - M, PH - 40, ACC_LIGHT, 0.6);\n  text(M, PH - 26, T.footer, { size: 8, color: GRAY });\n  const label = `${T.page} ${i + 1} / ${n}`;\n  text(PW - M - widthOf(label, false, 8), PH - 26, label, { size: 8, color: GRAY });\n}\n\n// ---- assemble the PDF file ----\nconst safeId = String(j.meeting_id || 'meeting').replace(/[^A-Za-z0-9_-]/g, '') || 'meeting';\nconst objs = {};\nobjs[1] = '<< /Type /Catalog /Pages 2 0 R >>';\nobjs[2] = `<< /Type /Pages /Kids [${pages.map((_, i) => `${6 + 2 * i} 0 R`).join(' ')}] /Count ${n} >>`;\nobjs[3] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>';\nobjs[4] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>';\nobjs[5] = `<< /Title (${T.title.replace(/[^\\x20-\\x7e]/g, 'e')} - ${safeId}) /Producer (n8n meeting assistant) >>`;\npages.forEach((ops, i) => {\n  const content = ops.join('\\n');\n  objs[6 + 2 * i] = `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${PW.toFixed(2)} ${PH.toFixed(2)}] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents ${7 + 2 * i} 0 R >>`;\n  objs[7 + 2 * i] = `<< /Length ${content.length} >>\\nstream\\n${content}\\nendstream`;\n});\nconst total = 5 + 2 * n;\nlet out = Buffer.from('%PDF-1.4\\n%\\xE2\\xE3\\xCF\\xD3\\n', 'latin1');\nconst offsets = [];\nfor (let k = 1; k <= total; k++) {\n  offsets[k] = out.length;\n  out = Buffer.concat([out, Buffer.from(`${k} 0 obj\\n${objs[k]}\\nendobj\\n`, 'latin1')]);\n}\nconst xrefPos = out.length;\nlet xref = `xref\\n0 ${total + 1}\\n0000000000 65535 f \\n`;\nfor (let k = 1; k <= total; k++) xref += `${String(offsets[k]).padStart(10, '0')} 00000 n \\n`;\nxref += `trailer\\n<< /Size ${total + 1} /Root 1 0 R /Info 5 0 R >>\\nstartxref\\n${xrefPos}\\n%%EOF\\n`;\nout = Buffer.concat([out, Buffer.from(xref, 'latin1')]);\n\nconst fileName = `${lang === 'fr' ? 'rapport' : 'report'}-${safeId}.pdf`;\nconst binary = await this.helpers.prepareBinaryData(out, fileName, 'application/pdf');\nreturn [{ json: j, binary: { report: binary } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2256,
+        224
+      ],
+      "name": "Code in JavaScript"
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond to Webhook": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "Split Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compression": {
+      "main": [
+        [
+          {
+            "node": "Extract Document Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Document Text": {
+      "main": [
+        [
+          {
+            "node": "Build Ollama Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Parse Ollama Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Markdown": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Files": {
+      "main": [
+        [
+          {
+            "node": "Compression",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Ollama Request": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Ollama Response": {
+      "main": [
+        [
+          {
+            "node": "Markdown",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Send an Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
